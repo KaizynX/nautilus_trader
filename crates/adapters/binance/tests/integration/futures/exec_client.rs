@@ -8248,3 +8248,79 @@ async fn test_tagged_lookup_failure_is_rejected_before_submission(
         Some("order.cancel" | "order.modify")
     )));
 }
+
+#[rstest]
+#[case::timestamp(-1021)]
+#[case::permission(-2015)]
+#[case::missing_order(-2013)]
+#[case::unknown_order(-2011)]
+#[tokio::test]
+async fn test_algo_cancel_first_error_is_visible_at_info(#[case] code: i64) {
+    let logger = install_position_log_capture();
+    let client_order_id = ClientOrderId::new("O-20261113-160002-406-003-1539");
+    let venue_order_id = VenueOrderId::from("4000002121549002");
+
+    let (addr, request_count) = start_exec_test_server_with_command_responses(CommandResponses {
+        algo_cancel: CommandResponse::VenueReject {
+            code,
+            msg: "first Algo cancellation failure",
+        },
+        cancel: CommandResponse::VenueReject {
+            code: -2011,
+            msg: "final regular cancellation failure",
+        },
+        ..Default::default()
+    })
+    .await;
+    let (mut client, mut rx, cache) =
+        create_test_execution_client(format!("http://{addr}"), format!("ws://{addr}/ws"));
+    add_test_account_to_cache(&cache, AccountId::from("BINANCE-001"));
+    client.start().unwrap();
+    client.connect().await.unwrap();
+    add_accepted_stop_market_order_to_cache(
+        &cache,
+        test_instrument_id(),
+        client_order_id,
+        test_strategy_id(),
+        OrderSide::Sell,
+        venue_order_id,
+    );
+    let mut command = cancel_order_command(client_order_id);
+    command.venue_order_id = Some(venue_order_id);
+    logger.take_records();
+    client.cancel_order(command).unwrap();
+    let event = recv_until(&mut rx, |event| {
+        matches!(
+            event, ExecutionEvent::Order(OrderEventAny::CancelRejected(event))
+                if event.client_order_id == client_order_id
+        )
+    })
+    .await;
+
+    let records = logger.take_records();
+    let first_errors: Vec<_> = records
+        .iter()
+        .filter(|(level, message)| {
+            *level == Level::Warn
+                && message.starts_with("Algo cancel failed, trying regular cancel:")
+        })
+        .collect();
+    assert_eq!(first_errors.len(), 1, "{records:?}");
+    let message = &first_errors[0].1;
+    assert!(message.contains("account_id=BINANCE-001"));
+    assert!(message.contains("instrument_id=BTCUSDT-PERP.BINANCE"));
+    assert!(message.contains(client_order_id.as_str()));
+    assert!(message.contains(venue_order_id.as_str()));
+    assert!(message.contains(&format!("Binance error {code} (HTTP 400)")));
+    assert!(message.contains("first Algo cancellation failure"));
+    assert!(!message.contains("test_api_key"));
+    assert!(!message.contains("test_api_secret"));
+    assert!(!message.contains("signature="));
+    assert!(!message.contains("final regular cancellation failure"));
+    let ExecutionEvent::Order(OrderEventAny::CancelRejected(event)) = event else {
+        unreachable!()
+    };
+    assert!(event.reason.contains("final regular cancellation failure"));
+    assert!(request_count.load(Ordering::Relaxed) >= 2);
+    client.disconnect().await.unwrap();
+}

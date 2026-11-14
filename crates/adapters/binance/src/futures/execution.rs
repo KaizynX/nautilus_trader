@@ -903,7 +903,11 @@ impl BinanceFuturesExecutionClient {
                     Ok(()) => Ok(()),
                     Err(algo_err) if !should_retry_regular_cancel(client_order_id, &algo_err) => Err(algo_err),
                     Err(algo_err) => {
-                        log::debug!("Algo cancel failed, trying regular cancel: {algo_err}");
+                        log::warn!(
+                            "Algo cancel failed, trying regular cancel: account_id={account_id}, instrument_id={instrument_id}, client_order_id={client_order_id}, venue_order_id={:?}, reason={}",
+                            command.venue_order_id,
+                            sanitize_reason(&algo_err.to_string()),
+                        );
                         http_client
                             .cancel_order(instrument_id, venue_order_id, Some(client_order_id))
                             .await
